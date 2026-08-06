@@ -1,19 +1,19 @@
-```
-            ██████╗ ██╗███╗   ███╗███████╗
-           ██╔═══██╗██║████╗ ████║██╔════╝
-           ██║   ██║██║██╔████╔██║███████╗
-           ██║▄▄ ██║██║██║╚██╔╝██║╚════██║
-           ╚██████╔╝██║██║ ╚═╝ ██║███████║
-            ╚══▀▀═╝ ╚═╝╚═╝     ╚═╝╚══════╝
-
-      ╌╌╌╌╌╌╌╌╌╌  c o n v e r t e r  ╌╌╌╌╌╌╌╌╌╌
-```
-
 <div align="center">
+<pre>
+╔══════════════════════════╗
+║                          ║
+║      ╔═╗  ╦ ╔╦╗ ╔═╗      ║
+║      ║═╬╗ ║ ║║║ ╚═╗      ║
+║      ╚═╝╚ ╩ ╩ ╩ ╚═╝      ║
+║                          ║
+║  ─ c o n v e r t e r ─   ║
+║                          ║
+╚══════════════════════════╝
+</pre>
 
 **Office documents in. Editor-ready HTML out.**
 
-A small, stateless HTTP service wrapping a LibreOffice + poppler pipeline.
+A small HTTP service wrapping a LibreOffice + poppler pipeline.
 
 </div>
 
