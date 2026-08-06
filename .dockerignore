@@ -1,0 +1,11 @@
+# target/ is the big one — a debug build here is ~400 MB and would be copied
+# into the build context only to be ignored by the multi-stage build.
+target/
+# ...except the release binary itself, which Dockerfile.prebuilt copies in
+# instead of compiling. Docker applies these patterns in order, so this
+# re-includes the one file without dragging in the rest of target/.
+!target/release/qims-backend
+data/
+.git/
+Dockerfile
+.dockerignore

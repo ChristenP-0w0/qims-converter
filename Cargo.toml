@@ -1,0 +1,16 @@
+[package]
+name = "qims-backend"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = "0.8.9"
+base64 = "0.22"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+log = { version = "0.4.33", features = ["std"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+surrealdb = { version = "3.2.1", features = ["protocol-http"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "process", "time", "sync"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tower-http = { version = "0.7.0", features = ["cors", "set-header"] }

@@ -1,0 +1,95 @@
+# syntax=docker/dockerfile:1.7
+#
+# The QIMS document converter, built from a PREBUILT binary.
+#
+# Same runtime as ./Dockerfile, minus the Rust builder stage: the binary is
+# compiled on the developer's machine and copied straight in. That trades a
+# ~10-minute cargo build (surrealdb dominates it, and is still linked in even
+# though convert-only mode never opens a connection) for a copy. The image is
+# still ~1 GB either way — LibreOffice is the bulk, not the Rust binary.
+#
+# Build (from this directory, after `cargo build --release`):
+#   docker build -f Dockerfile.prebuilt -t <your-registry>/qims/converter:<gitsha> .
+#
+# Use ./Dockerfile instead when you want the image built from source in CI.
+#
+# GLIBC FLOOR — the copied binary is dynamically linked against the glibc of
+# whatever host built it. The current release binary needs GLIBC_2.39, so the
+# runtime base MUST be at least that new:
+#   debian:bookworm-slim  2.36  -> TOO OLD, fails at exec
+#   ubuntu:24.04          2.39  -> exact floor
+#   debian:trixie-slim    2.41  -> what this uses
+# The `ldd` check below turns a mismatch into a build failure rather than a
+# container that crashloops with "GLIBC_2.39 not found". If you rebuild the
+# binary on a newer distro, re-check that floor.
+#
+# SECURITY — this service has NO authentication and CORS is allow-any
+# (src/main.rs sets allow_origin(Any) / allow_headers(Any)). It runs headless
+# LibreOffice over caller-supplied files, which is a large parsing surface. It
+# must never be exposed through an ingress or a published port. Run it on an
+# internal network only and let an authenticated application proxy to it, so
+# that application enforces auth on every conversion.
+
+FROM debian:trixie-slim AS runtime
+
+# What each package is for:
+#   libreoffice-writer  doc/docx/odt/rtf -> xhtml, and wmf/emf -> png
+#   poppler-utils       pdftohtml + pdftotext, the PDF path
+#   unzip               unpacking OOXML to salvage embedded media
+#   imagemagick         trims the canvas LibreOffice pads around metafiles
+#
+# The fonts are not cosmetic. The converter derives page geometry and
+# pagination from LibreOffice's rendering, so metric-compatible substitutes
+# for the fonts these documents actually use decide whether the imported page
+# breaks land where the author put them. Carlito matches Calibri, Caladea
+# matches Cambria, Liberation matches Arial/Times/Courier.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libreoffice-writer \
+        poppler-utils \
+        unzip \
+        imagemagick \
+        fonts-liberation2 \
+        fonts-crosextra-carlito \
+        fonts-crosextra-caladea \
+        fonts-dejavu-core \
+    && rm -rf /var/lib/apt/lists/*
+
+# The converter shells out to `magick` (the ImageMagick 7 name) and silently
+# keeps the untrimmed image when it is missing. Trixie ships v7, so `magick`
+# should already exist; the shim is a fallback for a base that only has the v6
+# `convert` binary, whose CLI accepts these arguments unchanged.
+RUN if ! command -v magick >/dev/null 2>&1 && command -v convert >/dev/null 2>&1; then \
+        printf '#!/bin/sh\nexec convert "$@"\n' > /usr/local/bin/magick \
+        && chmod +x /usr/local/bin/magick; \
+    fi
+
+# Path to the host-built binary, relative to the build context. Override if
+# you build somewhere other than the default cargo target dir.
+ARG BIN=target/release/qims-backend
+COPY ${BIN} /usr/local/bin/qims-backend
+
+# Fail the build here rather than at runtime if the binary needs a newer glibc
+# than this base provides — `ldd` prints "not found" and exits non-zero for an
+# unresolvable interpreter or symbol version.
+RUN ldd /usr/local/bin/qims-backend \
+    && ! ldd /usr/local/bin/qims-backend 2>&1 | grep -q "not found"
+
+# Unprivileged, with a writable HOME: LibreOffice insists on one even though
+# each conversion points -env:UserInstallation at its own scratch profile.
+RUN useradd --system --create-home --home-dir /home/qims --shell /usr/sbin/nologin qims
+USER qims
+ENV HOME=/home/qims
+
+# Drops the legacy SurrealDB routes so the binary serves /convert and /health
+# alone — without this it tries to reach a database that no longer exists.
+ENV QIMS_CONVERT_ONLY=1
+# The binary defaults to loopback, which is unreachable from outside the
+# container. This is still safe as long as no port is published.
+ENV QIMS_BIND=0.0.0.0:8787
+
+EXPOSE 8787
+
+# Deliberately no HEALTHCHECK: the image carries no curl/wget, and the
+# platform should own liveness. Point a probe at GET /health, which answers
+# "ok" without touching the conversion pipeline.
+CMD ["qims-backend"]
