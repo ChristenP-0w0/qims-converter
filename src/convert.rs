@@ -1,7 +1,7 @@
 //! `POST /convert?name=<filename>` — convert an uploaded office file or PDF to
 //! HTML so it can be imported into the editor. Conversion is done with tools
-//! on the host: LibreOffice (`soffice`) for doc/docx/odt/rtf and poppler's
-//! `pdftohtml` for PDFs.
+//! on the host: LibreOffice (`soffice`) for doc/docx/odt/rtf and for the
+//! spreadsheet formats xlsx/xls/ods, and poppler's `pdftohtml` for PDFs.
 
 use axum::{Json, body::Bytes, extract::Query};
 use serde::Deserialize;
@@ -35,9 +35,13 @@ pub async fn convert(
     // Validate BEFORE touching the filesystem — `ext` comes from the client
     // and is embedded in a path (a separator or unknown type must 400, not
     // 500 with a leaked scratch dir).
-    if !matches!(ext.as_str(), "doc" | "docx" | "odt" | "rtf" | "pdf") {
+    if !matches!(
+        ext.as_str(),
+        "doc" | "docx" | "odt" | "rtf" | "pdf" | "xlsx" | "xls" | "ods"
+    ) {
         return Err(AppError::BadRequest(format!(
-            "unsupported file type: .{ext} (use pdf, doc, docx, odt or rtf)"
+            "unsupported file type: .{ext} \
+             (use pdf, doc, docx, odt, rtf, xlsx, xls or ods)"
         )));
     }
 
@@ -60,11 +64,13 @@ pub async fn convert(
 
     let result = match ext.as_str() {
         "doc" | "docx" | "odt" | "rtf" => convert_office(&work, &input).await,
+        "xlsx" | "xls" | "ods" => convert_sheet(&work, &input).await,
         "pdf" => convert_pdf(&input).await.map(|html| {
             json!({ "html": html, "page": null, "pages": [], "footers": {} })
         }),
         other => Err(AppError::BadRequest(format!(
-            "unsupported file type: .{other} (use pdf, doc, docx, odt or rtf)"
+            "unsupported file type: .{other} \
+             (use pdf, doc, docx, odt, rtf, xlsx, xls or ods)"
         ))),
     };
     let _ = std::fs::remove_dir_all(&work);
@@ -227,6 +233,268 @@ async fn convert_office(
     let pages = page_snippets(work, input, &profile).await;
 
     Ok(json!({ "html": html, "page": page, "pages": pages, "footers": footers }))
+}
+
+/// Spreadsheets via LibreOffice.
+///
+/// Kept apart from `convert_office` because a spreadsheet differs in three
+/// ways that matter: images (the word-processor export embeds them, the
+/// spreadsheet one writes them as sibling PNGs next to the .xhtml, so a
+/// returned document would carry dead `src`s), the print range (the export
+/// dumps the whole used range, while a sheet prints only its print area), and
+/// where the page geometry lives — paper size and margins are per-sheet print
+/// settings rather than section properties, and a worksheet is far more often
+/// landscape than a text document is.
+async fn convert_sheet(
+    work: &std::path::Path,
+    input: &std::path::Path,
+) -> Result<JsonValue, AppError> {
+    let profile = work.join("profile");
+    // Plain `xhtml`, deliberately NOT `xhtml:XHTML Calc File:UTF8`. Naming the
+    // Calc filter explicitly drops every drawing object on the sheet — a
+    // workbook whose letterhead and stamps are images came through with none
+    // of them, and the export shrank by nearly half. Letting LibreOffice pick
+    // the filter for the input keeps them, written as sibling PNGs.
+    run(soffice(&profile)
+        .arg("--convert-to")
+        .arg("xhtml")
+        .arg("--outdir")
+        .arg(work)
+        .arg(input))
+    .await?;
+    let mut html = std::fs::read_to_string(input.with_extension("xhtml"))
+        .map_err(|_| AppError::Internal("LibreOffice produced no output".into()))?;
+
+    inline_sibling_images(work, &mut html);
+
+    let (page, print_area) = match unpack_workbook(work, input).await {
+        Ok(unpacked) => (sheet_page_setup(&unpacked), print_area(&unpacked)),
+        Err(err) => {
+            log::warn!("sheet page setup skipped: {err}");
+            (JsonValue::Null, JsonValue::Null)
+        }
+    };
+    let pages = page_snippets(work, input, &profile).await;
+
+    Ok(json!({
+        "html": html,
+        "page": page,
+        "pages": pages,
+        "footers": {},
+        "print_area": print_area,
+    }))
+}
+
+/// Unzip the workbook itself, for the print settings the HTML export drops.
+///
+/// `ensure_unpacked` cannot serve here: it converts its input to **docx** and
+/// unzips that, which for a spreadsheet yields a word-processor document with
+/// no `xl/` tree at all. An .xlsx is already the zip we want; .xls and .ods
+/// get converted to one first.
+async fn unpack_workbook(
+    work: &std::path::Path,
+    input: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let unpacked = work.join("workbook");
+    if unpacked.is_dir() {
+        return Ok(unpacked);
+    }
+    let xlsx = if input.extension().and_then(|e| e.to_str()) == Some("xlsx") {
+        input.to_path_buf()
+    } else {
+        let profile = work.join("profile");
+        run(soffice(&profile)
+            .arg("--convert-to")
+            .arg("xlsx")
+            .arg("--outdir")
+            .arg(work)
+            .arg(input))
+        .await
+        .map_err(|e| format!("xlsx conversion failed: {e}"))?;
+        input.with_extension("xlsx")
+    };
+    run(Command::new("unzip")
+        .arg("-o")
+        .arg("-q")
+        .arg(&xlsx)
+        .arg("-d")
+        .arg(&unpacked))
+    .await
+    .map_err(|e| format!("unzip failed: {e}"))?;
+    Ok(unpacked)
+}
+
+/// Rewrite `src="sheet_html_1a2b.png"` to a data URI, reading the file the
+/// spreadsheet filter dropped next to its output. Anything that cannot be read
+/// is left as it is: a missing picture beats a failed conversion.
+fn inline_sibling_images(work: &std::path::Path, html: &mut String) {
+    use base64::Engine as _;
+
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html.as_str();
+    while let Some(at) = rest.find("src=\"") {
+        let (before, from) = rest.split_at(at + 5);
+        out.push_str(before);
+        let Some(end) = from.find('"') else {
+            rest = from;
+            break;
+        };
+        let (raw, after) = from.split_at(end);
+        rest = after;
+        // Already inline, or not ours to resolve.
+        if raw.starts_with("data:") || raw.contains("://") || raw.contains('/') {
+            out.push_str(raw);
+            continue;
+        }
+        let name = percent_decode(raw);
+        let path = work.join(&name);
+        let mime = match name
+            .rsplit('.')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "png" => "image/png",
+            "gif" => "image/gif",
+            "svg" => "image/svg+xml",
+            _ => "image/jpeg",
+        };
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                out.push_str(&format!("data:{mime};base64,{encoded}"));
+            }
+            Err(_) => out.push_str(raw),
+        }
+    }
+    out.push_str(rest);
+    *html = out;
+}
+
+/// `%20` and friends — the spreadsheet filter percent-encodes the image
+/// filenames it derives from the workbook's own name, which usually has spaces
+/// in it.
+fn percent_decode(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(byte) = u8::from_str_radix(&raw[i + 1..i + 3], 16)
+        {
+            out.push(byte);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The sheet's print range (`_xlnm.Print_Area`) as zero-based cell bounds.
+///
+/// The HTML export dumps the whole used range, but a worksheet only prints
+/// what its print area covers — anything the author parked outside it (working
+/// notes, scratch columns) has never reached paper and is not part of the
+/// document. Reported rather than applied here: the frontend holds the parsed
+/// table and can crop it without re-parsing HTML.
+fn print_area(unpacked: &std::path::Path) -> JsonValue {
+    let Ok(book) = std::fs::read_to_string(unpacked.join("xl").join("workbook.xml")) else {
+        return JsonValue::Null;
+    };
+    let Some(i) = book.find("_xlnm.Print_Area") else {
+        return JsonValue::Null;
+    };
+    let Some(start) = book[i..].find('>').map(|j| i + j + 1) else {
+        return JsonValue::Null;
+    };
+    let Some(end) = book[start..].find('<').map(|j| start + j) else {
+        return JsonValue::Null;
+    };
+    // 'A Sheet'!$A$1:$M$28 — the sheet name is irrelevant, only one sheet is
+    // exported. A multi-range print area (comma separated) is left alone:
+    // cropping to the first range only would silently lose the rest.
+    let range = &book[start..end];
+    if range.contains(',') {
+        return JsonValue::Null;
+    }
+    let Some((from, to)) = range.rsplit('!').next().and_then(|r| r.split_once(':')) else {
+        return JsonValue::Null;
+    };
+    match (cell_ref(from), cell_ref(to)) {
+        (Some((left, top)), Some((right, bottom))) => json!({
+            "top": top, "left": left, "bottom": bottom, "right": right,
+        }),
+        _ => JsonValue::Null,
+    }
+}
+
+/// `$M$28` → (12, 27): zero-based column then row.
+fn cell_ref(raw: &str) -> Option<(i64, i64)> {
+    let cleaned: String = raw.chars().filter(|c| *c != '$').collect();
+    let split = cleaned.find(|c: char| c.is_ascii_digit())?;
+    let (letters, digits) = cleaned.split_at(split);
+    if letters.is_empty() {
+        return None;
+    }
+    let mut col: i64 = 0;
+    for c in letters.chars() {
+        if !c.is_ascii_alphabetic() {
+            return None;
+        }
+        col = col * 26 + (c.to_ascii_uppercase() as i64 - 'A' as i64 + 1);
+    }
+    Some((col - 1, digits.parse::<i64>().ok()? - 1))
+}
+
+/// Page geometry from a worksheet's print settings (`xl/worksheets/sheet1.xml`).
+///
+/// `<pageSetup paperSize orientation>` names the paper — 9 is A4, 1 is Letter,
+/// and anything else falls back to A4 rather than guessing — while
+/// `<pageMargins>` gives the margins in inches. Landscape swaps width and
+/// height, which is the common case for a worksheet and the reason this is
+/// worth reading at all: rendered portrait, a wide sheet loses its right-hand
+/// columns.
+fn sheet_page_setup(unpacked: &std::path::Path) -> JsonValue {
+    let Ok(sheet) =
+        std::fs::read_to_string(unpacked.join("xl").join("worksheets").join("sheet1.xml"))
+    else {
+        return JsonValue::Null;
+    };
+    let attr = |tag: &str, name: &str| -> Option<String> {
+        let i = sheet.find(tag)?;
+        let end = sheet[i..].find('>')? + i;
+        let frag = &sheet[i..end];
+        let key = format!("{name}=\"");
+        let j = frag.find(&key)? + key.len();
+        let k = frag[j..].find('"')? + j;
+        Some(frag[j..k].to_string())
+    };
+    let inches = |name: &str, fallback: f64| -> i64 {
+        let value = attr("<pageMargins", name)
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(fallback);
+        (value * 96.0).round() as i64
+    };
+    // A4 (210×297mm) and Letter (8.5×11in) at 96 dpi.
+    let (mut width, mut height) = match attr("<pageSetup", "paperSize").as_deref() {
+        Some("1") | Some("2") => (816, 1056),
+        _ => (794, 1123),
+    };
+    if attr("<pageSetup", "orientation").as_deref() == Some("landscape") {
+        std::mem::swap(&mut width, &mut height);
+    }
+    json!({
+        "width": width,
+        "height": height,
+        "top": inches("top", 0.75),
+        "right": inches("right", 0.7),
+        "bottom": inches("bottom", 0.75),
+        "left": inches("left", 0.7),
+    })
 }
 
 /// Page geometry from the OOXML section properties (twips → px at 96 dpi).
