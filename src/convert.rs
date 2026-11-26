@@ -37,11 +37,11 @@ pub async fn convert(
     // 500 with a leaked scratch dir).
     if !matches!(
         ext.as_str(),
-        "doc" | "docx" | "odt" | "rtf" | "pdf" | "xlsx" | "xls" | "ods"
+        "doc" | "docx" | "odt" | "rtf" | "pdf" | "xlsx" | "xlsm" | "xls" | "ods"
     ) {
         return Err(AppError::BadRequest(format!(
             "unsupported file type: .{ext} \
-             (use pdf, doc, docx, odt, rtf, xlsx, xls or ods)"
+             (use pdf, doc, docx, odt, rtf, xlsx, xlsm, xls or ods)"
         )));
     }
 
@@ -64,13 +64,13 @@ pub async fn convert(
 
     let result = match ext.as_str() {
         "doc" | "docx" | "odt" | "rtf" => convert_office(&work, &input).await,
-        "xlsx" | "xls" | "ods" => convert_sheet(&work, &input).await,
+        "xlsx" | "xlsm" | "xls" | "ods" => convert_sheet(&work, &input).await,
         "pdf" => convert_pdf(&input).await.map(|html| {
             json!({ "html": html, "page": null, "pages": [], "footers": {} })
         }),
         other => Err(AppError::BadRequest(format!(
             "unsupported file type: .{other} \
-             (use pdf, doc, docx, odt, rtf, xlsx, xls or ods)"
+             (use pdf, doc, docx, odt, rtf, xlsx, xlsm, xls or ods)"
         ))),
     };
     let _ = std::fs::remove_dir_all(&work);
@@ -165,19 +165,31 @@ async fn convert_office(
     // the document actually renders); the legacy HTML filter loses it. Fall
     // back to the legacy filter if the XHTML conversion fails in ANY way —
     // command error or missing output file.
-    let xhtml = match run(soffice(&profile)
-        .arg("--convert-to")
-        .arg("xhtml:XHTML Writer File:UTF8")
-        .arg("--outdir")
-        .arg(work)
-        .arg(input))
-    .await
-    {
-        Ok(_) => std::fs::read_to_string(input.with_extension("xhtml")).ok(),
-        Err(err) => {
-            log::warn!("XHTML filter failed, falling back to legacy HTML: {err}");
-            None
+    //
+    // First choice goes through flat ODT so tabs survive (see
+    // `xhtml_keeping_tabs`); the direct export is the fallback.
+    let mut tabs = JsonValue::Null;
+    let mut rows = JsonValue::Null;
+    let xhtml = match xhtml_keeping_tabs(work, input, &profile).await {
+        Some((xhtml, stops, heights)) => {
+            tabs = stops;
+            rows = heights;
+            Some(xhtml)
         }
+        None => match run(soffice(&profile)
+            .arg("--convert-to")
+            .arg("xhtml:XHTML Writer File:UTF8")
+            .arg("--outdir")
+            .arg(work)
+            .arg(input))
+        .await
+        {
+            Ok(_) => std::fs::read_to_string(input.with_extension("xhtml")).ok(),
+            Err(err) => {
+                log::warn!("XHTML filter failed, falling back to legacy HTML: {err}");
+                None
+            }
+        },
     };
     let mut html = match xhtml {
         Some(xhtml) => xhtml,
@@ -232,7 +244,317 @@ async fn convert_office(
     // hard page breaks.
     let pages = page_snippets(work, input, &profile).await;
 
-    Ok(json!({ "html": html, "page": page, "pages": pages, "footers": footers }))
+    Ok(json!({
+        "html": html,
+        "page": page,
+        "pages": pages,
+        "footers": footers,
+        "tabs": tabs,
+        "rows": rows,
+    }))
+}
+
+/// Stands in for every tab in the XHTML. A private-use code point, so it
+/// cannot collide with real text.
+const TAB_MARK: char = '\u{E009}';
+
+/// XHTML with each tab kept as [`TAB_MARK`], plus the tab stops that place
+/// them.
+///
+/// LibreOffice's XHTML export (an XSLT) writes a tab as eight alternating
+/// no-break and plain spaces, or as one no-break space, and drops the tab
+/// stops. A table of contents loses its dot leaders and right-aligned page
+/// numbers, and tabbed columns stop lining up. So: export flat ODT, swap each
+/// `<text:tab/>` for the mark, read the stops from the same file, then export
+/// that file to XHTML. The receiver lays the marks out against the stops.
+async fn xhtml_keeping_tabs(
+    work: &std::path::Path,
+    input: &std::path::Path,
+    profile: &std::path::Path,
+) -> Option<(String, JsonValue, JsonValue)> {
+    let flat = work.join("flat");
+    if let Err(err) = run(soffice(profile)
+        .arg("--convert-to")
+        .arg("fodt")
+        .arg("--outdir")
+        .arg(&flat)
+        .arg(input))
+    .await
+    {
+        log::warn!("flat ODT export failed, tabs will be approximated: {err}");
+        return None;
+    }
+    let stem = input.file_stem()?;
+    let fodt_path = flat.join(stem).with_extension("fodt");
+    let fodt = std::fs::read_to_string(&fodt_path).ok()?;
+    let stops = tab_stops(&fodt);
+    let heights = row_heights(&fodt);
+    std::fs::write(&fodt_path, patch_flat(&fodt)).ok()?;
+    if let Err(err) = run(soffice(profile)
+        .arg("--convert-to")
+        .arg("xhtml:XHTML Writer File:UTF8")
+        .arg("--outdir")
+        .arg(&flat)
+        .arg(&fodt_path))
+    .await
+    {
+        log::warn!("XHTML export of the flat ODT failed: {err}");
+        return None;
+    }
+    let xhtml = std::fs::read_to_string(fodt_path.with_extension("xhtml")).ok()?;
+    Some((xhtml, stops, heights))
+}
+
+/// Table row heights the XHTML export drops, keyed like its row classes
+/// (`Table1.4` → `Table1_4`, written `row-Table1_4` on the `<tr>`), in px.
+///
+/// A form's writing box is often an empty row held open by its height —
+/// SF235's NOTES box is a min-row-height of 8cm — and without it the box
+/// shrank to one line. Both a minimum and an exact height count, as minimums.
+fn row_heights(fodt: &str) -> JsonValue {
+    let mut rows = serde_json::Map::new();
+    for style in split_tags(fodt, "style:style") {
+        let open = &style[..style.find('>').unwrap_or(style.len())];
+        if attr(open, "style:family").as_deref() != Some("table-row") {
+            continue;
+        }
+        let Some(name) = attr(open, "style:name") else { continue };
+        let props = split_tags(&style, "style:table-row-properties");
+        let Some(props) = props.first() else { continue };
+        let height = attr(props, "style:min-row-height")
+            .or_else(|| attr(props, "style:row-height"))
+            .and_then(|v| length_px(&v));
+        if let Some(height) = height {
+            rows.insert(name.replace('.', "_"), json!(height));
+        }
+    }
+    JsonValue::Object(rows)
+}
+
+/// Work around what LibreOffice's XHTML export gets wrong, in the flat ODT it
+/// exports from: tabs (see `mark_tabs`), list indents and end alignment.
+fn patch_flat(fodt: &str) -> String {
+    // The export maps `end` to `left` for left-to-right text (its
+    // style_mapping_css.xsl) — right-aligned codes, dates and signature
+    // lines came in left-aligned.
+    let aligned = mark_tabs(fodt).replace("fo:text-align=\"end\"", "fo:text-align=\"right\"");
+    legacy_list_levels(&aligned)
+}
+
+/// Rewrite list levels from Word's "label alignment" form to the older
+/// "label width and position" form, the only one the XHTML export indents.
+///
+/// Every list from a Word document uses the newer form, and the export wrote
+/// each item at `margin-left: 0cm`: nested bullets all sat on the margin. The
+/// two say the same thing — the label starts at margin-left + text-indent and
+/// the text at margin-left — so `space-before` = margin-left + text-indent and
+/// `min-label-width` = −text-indent.
+fn legacy_list_levels(fodt: &str) -> String {
+    const OPEN: &str = "<style:list-level-properties text:list-level-position-and-space-mode=\"label-alignment\"";
+    const CLOSE: &str = "</style:list-level-properties>";
+    let cm = |px: f64| format!("{:.3}cm", px * 2.54 / 96.0);
+    let mut out = String::with_capacity(fodt.len());
+    let mut rest = fodt;
+    while let Some(i) = rest.find(OPEN) {
+        out.push_str(&rest[..i]);
+        let block = &rest[i..];
+        let Some(end) = block.find(CLOSE) else {
+            out.push_str(block);
+            return out;
+        };
+        let props = &block[..end + CLOSE.len()];
+        let alignment = split_tags(props, "style:list-level-label-alignment");
+        match alignment.first() {
+            Some(a) => {
+                let margin = attr(a, "fo:margin-left").and_then(|v| length_px(&v)).unwrap_or(0.0);
+                let indent = attr(a, "fo:text-indent").and_then(|v| length_px(&v)).unwrap_or(0.0);
+                out.push_str(&format!(
+                    "<style:list-level-properties text:space-before=\"{}\" text:min-label-width=\"{}\"/>",
+                    cm(margin + indent),
+                    cm(-indent)
+                ));
+            }
+            None => out.push_str(props),
+        }
+        rest = &block[end + CLOSE.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Replace every `<text:tab/>` (with or without attributes) with [`TAB_MARK`].
+fn mark_tabs(fodt: &str) -> String {
+    let mut out = String::with_capacity(fodt.len());
+    let mut rest = fodt;
+    while let Some(i) = rest.find("<text:tab") {
+        let after = &rest[i + "<text:tab".len()..];
+        // `<text:table…`, `<text:tab-stop…` share the prefix.
+        let is_tab = after.starts_with("/>") || after.starts_with(' ');
+        let end = after.find("/>").filter(|_| is_tab);
+        match end {
+            Some(end) if !after[..end].contains('>') => {
+                out.push_str(&rest[..i]);
+                out.push(TAB_MARK);
+                rest = &after[end + 2..];
+            }
+            _ => {
+                out.push_str(&rest[..i + 1]);
+                rest = &rest[i + 1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The tab stops each paragraph style ends up with, keyed by style name —
+/// which is the XHTML class minus its `paragraph-` prefix.
+///
+/// `{ "distance": px, "relative_to_indent": bool, "styles": { name: [ { "pos":
+/// px, "align": "left|right|center|decimal", "leader": "dotted|solid|dashed"
+/// } ] } }`. A style without its own `<style:tab-stops>` inherits its parent's;
+/// one with them replaces the parent's outright, as ODF says. `distance` is the
+/// default stop spacing used past the last explicit stop.
+fn tab_stops(fodt: &str) -> JsonValue {
+    // name → (parent, own stops or None when the style declares none)
+    let mut own: std::collections::HashMap<String, (Option<String>, Option<Vec<JsonValue>>)> =
+        std::collections::HashMap::new();
+    for style in split_tags(fodt, "style:style") {
+        let open = &style[..style.find('>').unwrap_or(style.len())];
+        if attr(open, "style:family").as_deref() != Some("paragraph") {
+            continue;
+        }
+        let Some(name) = attr(open, "style:name") else {
+            continue;
+        };
+        let stops = style.contains("<style:tab-stops").then(|| {
+            split_tags(&style, "style:tab-stop")
+                .iter()
+                .filter_map(|stop| {
+                    let pos = length_px(&attr(stop, "style:position")?)?;
+                    let align = attr(stop, "style:type")
+                        .or_else(|| attr(stop, "style:char").map(|_| "decimal".into()))
+                        .unwrap_or_else(|| "left".into());
+                    let leader = match (
+                        attr(stop, "style:leader-text").as_deref(),
+                        attr(stop, "style:leader-style").as_deref(),
+                    ) {
+                        (_, None | Some("none")) => JsonValue::Null,
+                        (Some("."), _) | (_, Some("dotted")) => json!("dotted"),
+                        (Some("-"), _) | (_, Some("dash" | "long-dash")) => json!("dashed"),
+                        _ => json!("solid"),
+                    };
+                    Some(json!({ "pos": pos, "align": align, "leader": leader }))
+                })
+                .collect()
+        });
+        own.insert(name, (attr(open, "style:parent-style-name"), stops));
+    }
+
+    let mut styles = serde_json::Map::new();
+    for name in own.keys() {
+        let mut at = Some(name.clone());
+        // Bounded walk: a parent cycle in a broken file must not hang us.
+        for _ in 0..32 {
+            let Some((parent, stops)) = at.as_ref().and_then(|n| own.get(n)) else {
+                break;
+            };
+            if let Some(stops) = stops {
+                if !stops.is_empty() {
+                    styles.insert(name.clone(), JsonValue::Array(stops.clone()));
+                }
+                break;
+            }
+            at = parent.clone();
+        }
+    }
+
+    let defaults = split_tags(fodt, "style:default-style")
+        .into_iter()
+        .find(|s| attr(s, "style:family").as_deref() == Some("paragraph"));
+    let distance = defaults
+        .as_deref()
+        .and_then(|s| attr(s, "style:tab-stop-distance"))
+        .and_then(|v| length_px(&v))
+        .unwrap_or(48.0); // 1.27cm, LibreOffice's own default
+    // Word documents measure stops from the page margin; ODF from the indent.
+    let relative_to_indent = !fodt.contains(
+        "config:name=\"TabsRelativeToIndent\" config:type=\"boolean\">false<",
+    );
+    json!({ "distance": distance, "relative_to_indent": relative_to_indent, "styles": styles })
+}
+
+/// The value of `name="…"` in a tag, if present.
+fn attr(tag: &str, name: &str) -> Option<String> {
+    let key = format!(" {name}=\"");
+    let start = tag.find(&key)? + key.len();
+    let end = tag[start..].find('"')? + start;
+    Some(tag[start..end].to_string())
+}
+
+/// An ODF length ("1.27cm", "0.5in", "12pt", "5mm") in CSS px at 96 dpi.
+fn length_px(value: &str) -> Option<f64> {
+    let split = value.find(|c: char| c.is_ascii_alphabetic())?;
+    let number: f64 = value[..split].parse().ok()?;
+    let per_unit = match &value[split..] {
+        "cm" => 96.0 / 2.54,
+        "mm" => 96.0 / 25.4,
+        "in" => 96.0,
+        "pt" => 96.0 / 72.0,
+        "pc" => 16.0,
+        "px" => 1.0,
+        _ => return None,
+    };
+    Some((number * per_unit * 100.0).round() / 100.0)
+}
+
+#[cfg(test)]
+mod tab_tests {
+    use super::*;
+
+    #[test]
+    fn rewrites_list_levels_and_end_alignment() {
+        let fodt = r#"<style:paragraph-properties fo:text-align="end"/><text:list-level-style-bullet text:level="2"><style:list-level-properties text:list-level-position-and-space-mode="label-alignment"><style:list-level-label-alignment text:label-followed-by="listtab" fo:text-indent="-0.635cm" fo:margin-left="2.54cm"/></style:list-level-properties></text:list-level-style-bullet><style:list-level-properties text:min-label-width="1cm"/>"#;
+        let out = patch_flat(fodt);
+        assert!(out.contains(r#"fo:text-align="right""#));
+        assert!(out.contains(r#"<style:list-level-properties text:space-before="1.905cm" text:min-label-width="0.635cm"/>"#), "{out}");
+        assert!(out.contains(r#"<style:list-level-properties text:min-label-width="1cm"/>"#), "older form left alone");
+    }
+
+    #[test]
+    fn marks_tabs_but_not_tables_or_stops() {
+        let fodt = r#"<text:p>1.<text:tab/>A<text:tab text:tab-ref="2"/>2</text:p><text:table-of-content/><style:tab-stop style:position="1cm"/>"#;
+        let out = mark_tabs(fodt);
+        assert_eq!(out.matches(TAB_MARK).count(), 2);
+        assert!(out.contains("<text:table-of-content/>"));
+        assert!(out.contains("<style:tab-stop "));
+    }
+
+    #[test]
+    fn resolves_inherited_stops_and_units() {
+        let fodt = r#"
+<style:default-style style:family="paragraph"><style:paragraph-properties style:tab-stop-distance="2.54cm"/></style:default-style>
+<style:style style:name="Contents_20_2" style:family="paragraph" style:parent-style-name="Standard"><style:paragraph-properties><style:tab-stops><style:tab-stop style:position="0.635cm"/><style:tab-stop style:position="14.984cm" style:type="right" style:leader-style="dotted" style:leader-text="."/></style:tab-stops></style:paragraph-properties></style:style>
+<style:style style:name="P5" style:family="paragraph" style:parent-style-name="Contents_20_2"><style:paragraph-properties fo:margin-left="1cm"/></style:style>
+<style:style style:name="P6" style:family="paragraph" style:parent-style-name="Contents_20_2"><style:paragraph-properties><style:tab-stops/></style:paragraph-properties></style:style>
+<style:style style:name="T1" style:family="text"/>
+<config:config-item config:name="TabsRelativeToIndent" config:type="boolean">false</config:config-item>"#;
+        let tabs = tab_stops(fodt);
+        assert_eq!(tabs["distance"], json!(96.0));
+        assert_eq!(tabs["relative_to_indent"], json!(false));
+        let toc = &tabs["styles"]["Contents_20_2"];
+        assert_eq!(toc[0], json!({ "pos": 24.0, "align": "left", "leader": null }));
+        assert_eq!(toc[1]["align"], json!("right"));
+        assert_eq!(toc[1]["leader"], json!("dotted"));
+        assert_eq!(tabs["styles"]["P5"], *toc, "inherits the parent's stops");
+        assert!(tabs["styles"].get("P6").is_none(), "empty tab-stops clears them");
+        assert_eq!(length_px("0.5in"), Some(48.0));
+
+        let rows = row_heights(
+            r#"<style:style style:name="Table1.4" style:family="table-row"><style:table-row-properties style:min-row-height="7.999cm"/></style:style><style:style style:name="Table1.1" style:family="table-row"><style:table-row-properties fo:keep-together="always"/></style:style>"#,
+        );
+        assert_eq!(rows, json!({ "Table1_4": 302.32 }));
+    }
 }
 
 /// Spreadsheets via LibreOffice.
@@ -250,6 +572,22 @@ async fn convert_sheet(
     input: &std::path::Path,
 ) -> Result<JsonValue, AppError> {
     let profile = work.join("profile");
+    // Workbook data first: it is cheap, and a workbook too big to import is
+    // turned away before LibreOffice spends a minute exporting it.
+    let (page, print_area, sheets) = match unpack_workbook(work, input).await {
+        Ok(unpacked) => {
+            let sheets = workbook_sheets(&unpacked);
+            (sheet_page_setup(&unpacked, &sheets), print_area(&unpacked), sheets)
+        }
+        Err(err) => {
+            log::warn!("sheet page setup skipped: {err}");
+            (JsonValue::Null, JsonValue::Null, Vec::new())
+        }
+    };
+    if let Some(refusal) = too_large(&sheets) {
+        return Err(AppError::BadRequest(refusal));
+    }
+
     // Plain `xhtml`, deliberately NOT `xhtml:XHTML Calc File:UTF8`. Naming the
     // Calc filter explicitly drops every drawing object on the sheet — a
     // workbook whose letterhead and stamps are images came through with none
@@ -267,13 +605,7 @@ async fn convert_sheet(
 
     inline_sibling_images(work, &mut html);
 
-    let (page, print_area) = match unpack_workbook(work, input).await {
-        Ok(unpacked) => (sheet_page_setup(&unpacked), print_area(&unpacked)),
-        Err(err) => {
-            log::warn!("sheet page setup skipped: {err}");
-            (JsonValue::Null, JsonValue::Null)
-        }
-    };
+    let sheets: Vec<JsonValue> = sheets.into_iter().map(|s| s.json).collect();
     let pages = page_snippets(work, input, &profile).await;
 
     Ok(json!({
@@ -282,6 +614,7 @@ async fn convert_sheet(
         "pages": pages,
         "footers": {},
         "print_area": print_area,
+        "sheets": sheets,
     }))
 }
 
@@ -450,7 +783,232 @@ fn cell_ref(raw: &str) -> Option<(i64, i64)> {
     Some((col - 1, digits.parse::<i64>().ok()? - 1))
 }
 
-/// Page geometry from a worksheet's print settings (`xl/worksheets/sheet1.xml`).
+/// The most filled cells (across visible sheets) a workbook may have to be
+/// imported. Forms and worksheets run to a few hundred; the largest chart
+/// workbook seen has ~6,700. Past this the import is a data log, not a form:
+/// a 100,000-cell one exported 55 MB of HTML and hung the browser.
+const MAX_SHEET_CELLS: usize = 20_000;
+
+/// Why a workbook is refused, worded for the person importing it; None when
+/// it is small enough.
+fn too_large(sheets: &[Sheet]) -> Option<String> {
+    let filled: usize = sheets
+        .iter()
+        .filter(|s| !s.hidden)
+        .map(|s| s.json["cells"].as_object().map_or(0, |c| c.len()))
+        .sum();
+    (filled > MAX_SHEET_CELLS).then(|| {
+        format!(
+            "This spreadsheet is too large to import: it has {filled} filled cells, and QIMS \
+             imports up to {MAX_SHEET_CELLS}. Import a smaller workbook, or ask IT if this one \
+             needs to come in."
+        )
+    })
+}
+
+/// One worksheet as the workbook lists it, in tab order.
+struct Sheet {
+    hidden: bool,
+    path: std::path::PathBuf,
+    /// `{ name, hidden, print_area, cells: { "B4": [points, wrap] } }`
+    json: JsonValue,
+}
+
+/// Every worksheet with the cell formatting the HTML export loses.
+///
+/// The export rounds each font size to one of seven HTML sizes (10pt and 11pt
+/// come out the same, and the default lands on `x-small`) and does not say
+/// whether a cell wraps — which is what decides, in Excel, whether text runs
+/// on over the empty cells beside it or breaks onto a second line. Both are
+/// read here from the workbook itself: `styles.xml` for the font size and
+/// wrap of each cell format, the sheet for which format each filled cell
+/// uses. Print areas are per sheet (`localSheetId` is the tab index).
+fn workbook_sheets(unpacked: &std::path::Path) -> Vec<Sheet> {
+    let xl = unpacked.join("xl");
+    let read = |p: std::path::PathBuf| std::fs::read_to_string(p).unwrap_or_default();
+    let book = read(xl.join("workbook.xml"));
+    let rich = shared_rich_text(&read(xl.join("sharedStrings.xml")));
+    let rels = read(xl.join("_rels").join("workbook.xml.rels"));
+    let styles = read(xl.join("styles.xml"));
+
+    // Font sizes by font id, then (points, wrap) by cell format index.
+    let section = |xml: &str, tag: &str| -> String {
+        split_tags(xml, tag).into_iter().next().unwrap_or_default()
+    };
+    let font_sizes: Vec<Option<f64>> = split_tags(&section(&styles, "fonts"), "font")
+        .iter()
+        .map(|font| {
+            split_tags(font, "sz")
+                .first()
+                .and_then(|sz| attr(sz, "val"))
+                .and_then(|v| v.parse().ok())
+        })
+        .collect();
+    let formats: Vec<(Option<f64>, bool)> = split_tags(&section(&styles, "cellXfs"), "xf")
+        .iter()
+        .map(|xf| {
+            let size = attr(xf, "fontId")
+                .and_then(|id| id.parse::<usize>().ok())
+                .and_then(|id| font_sizes.get(id).copied().flatten());
+            let wrap = split_tags(xf, "alignment")
+                .first()
+                .and_then(|a| attr(a, "wrapText"))
+                .is_some_and(|v| v == "1" || v == "true");
+            (size, wrap)
+        })
+        .collect();
+
+    let defined: Vec<String> = split_tags(&book, "definedName");
+    split_tags(&book, "sheet")
+        .iter()
+        .enumerate()
+        .filter_map(|(index, tag)| {
+            let name = xml_unescape(&attr(tag, "name")?);
+            let rid = attr(tag, "r:id")?;
+            let rel = split_tags(&rels, "Relationship")
+                .into_iter()
+                .find(|r| attr(r, "Id").as_deref() == Some(rid.as_str()))?;
+            let target = attr(&rel, "Target")?;
+            let path = match target.strip_prefix('/') {
+                Some(absolute) => unpacked.join(absolute),
+                None => xl.join(target),
+            };
+            let hidden = attr(tag, "state").is_some_and(|s| s != "visible");
+
+            let area = defined
+                .iter()
+                .find(|d| {
+                    attr(d, "name").as_deref() == Some("_xlnm.Print_Area")
+                        && attr(d, "localSheetId").as_deref() == Some(index.to_string().as_str())
+                })
+                .and_then(|d| print_range(&d[d.find('>')? + 1..d.rfind('<')?]))
+                .unwrap_or(JsonValue::Null);
+
+            let xml = read(path.clone());
+            let mut cells = serde_json::Map::new();
+            let mut rich_cells = serde_json::Map::new();
+            for cell in split_tags(&xml, "c") {
+                // Only cells with something in them: an empty formatted cell
+                // has nothing to size or wrap.
+                if !(cell.contains("<v>") || cell.contains("<is>") || cell.contains("<f")) {
+                    continue;
+                }
+                let Some(r) = attr(&cell, "r") else { continue };
+                let format = attr(&cell, "s").and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+                let (size, wrap) = formats.get(format).copied().unwrap_or((None, false));
+                // A shared string written in runs of differing format.
+                if attr(&cell, "t").as_deref() == Some("s") {
+                    let runs = split_tags(&cell, "v")
+                        .first()
+                        .and_then(|v| v[3..v.len() - 4].trim().parse::<usize>().ok())
+                        .and_then(|i| rich.get(i).cloned().flatten());
+                    if let Some(runs) = runs {
+                        rich_cells.insert(r.clone(), runs);
+                    }
+                }
+                cells.insert(r, json!([size, wrap]));
+            }
+            Some(Sheet {
+                hidden,
+                path,
+                json: json!({
+                    "name": name,
+                    "hidden": hidden,
+                    "print_area": area,
+                    "cells": cells,
+                    "rich": rich_cells,
+                }),
+            })
+        })
+        .collect()
+}
+
+/// Each shared string that is written in formatted runs, as
+/// `[[text, format | null], …]`; None for a plain string.
+///
+/// The HTML export gives a cell one font, so "**BW =** Big well" lost its bold
+/// label and footnote marks their superscript. A run's `format` holds only
+/// what it sets — `b`, `i`, `u`, `s`, `sup`, `sub`, `sz` (points), `color`
+/// (#rrggbb) — and is null for a run with no properties of its own, which
+/// takes the cell's format.
+fn shared_rich_text(sst: &str) -> Vec<Option<JsonValue>> {
+    // `<b/>`, or `<b val="…"/>` where 0/false/none turns it off.
+    let on = |props: &str, tag: &str| -> bool {
+        props.contains(&format!("<{tag}/>"))
+            || split_tags(props, tag).first().is_some_and(|t| {
+                !matches!(attr(t, "val").as_deref(), Some("0" | "false" | "none"))
+            })
+    };
+    split_tags(sst, "si")
+        .iter()
+        .map(|si| {
+            let runs = split_tags(si, "r");
+            if runs.is_empty() {
+                return None;
+            }
+            let parts: Vec<JsonValue> = runs
+                .iter()
+                .map(|run| {
+                    let text: String = split_tags(run, "t")
+                        .iter()
+                        .filter_map(|t| Some(xml_unescape(&t[t.find('>')? + 1..t.rfind('<')?])))
+                        .collect();
+                    let format = split_tags(run, "rPr").first().map(|props| {
+                        let mut f = serde_json::Map::new();
+                        for (key, tag) in [("b", "b"), ("i", "i"), ("u", "u"), ("s", "strike")] {
+                            if on(props, tag) {
+                                f.insert(key.into(), json!(true));
+                            }
+                        }
+                        match split_tags(props, "vertAlign").first().and_then(|v| attr(v, "val")) {
+                            Some(v) if v == "superscript" => drop(f.insert("sup".into(), json!(true))),
+                            Some(v) if v == "subscript" => drop(f.insert("sub".into(), json!(true))),
+                            _ => {}
+                        }
+                        if let Some(sz) = split_tags(props, "sz")
+                            .first()
+                            .and_then(|t| attr(t, "val"))
+                            .and_then(|v| v.parse::<f64>().ok())
+                        {
+                            f.insert("sz".into(), json!(sz));
+                        }
+                        // ARGB; theme and indexed colours are left to the cell.
+                        if let Some(rgb) = split_tags(props, "color").first().and_then(|t| attr(t, "rgb")) {
+                            if rgb.len() == 8 {
+                                f.insert("color".into(), json!(format!("#{}", &rgb[2..]).to_lowercase()));
+                            }
+                        }
+                        JsonValue::Object(f)
+                    });
+                    json!([text, format])
+                })
+                .collect();
+            Some(JsonValue::Array(parts))
+        })
+        .collect()
+}
+
+/// `'A Sheet'!$A$1:$M$28` → `{top,left,bottom,right}`; None for a multi-range
+/// area, which cropping to one range would silently cut short.
+fn print_range(range: &str) -> Option<JsonValue> {
+    if range.contains(',') {
+        return None;
+    }
+    let (from, to) = range.rsplit('!').next()?.split_once(':')?;
+    let ((left, top), (right, bottom)) = (cell_ref(from)?, cell_ref(to)?);
+    Some(json!({ "top": top, "left": left, "bottom": bottom, "right": right }))
+}
+
+/// The five XML entities, for attribute values shown to people.
+fn xml_unescape(raw: &str) -> String {
+    raw.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+/// Page geometry from the first visible worksheet's print settings.
 ///
 /// `<pageSetup paperSize orientation>` names the paper — 9 is A4, 1 is Letter,
 /// and anything else falls back to A4 rather than guessing — while
@@ -458,10 +1016,15 @@ fn cell_ref(raw: &str) -> Option<(i64, i64)> {
 /// height, which is the common case for a worksheet and the reason this is
 /// worth reading at all: rendered portrait, a wide sheet loses its right-hand
 /// columns.
-fn sheet_page_setup(unpacked: &std::path::Path) -> JsonValue {
-    let Ok(sheet) =
-        std::fs::read_to_string(unpacked.join("xl").join("worksheets").join("sheet1.xml"))
-    else {
+fn sheet_page_setup(unpacked: &std::path::Path, sheets: &[Sheet]) -> JsonValue {
+    // The first sheet that prints, not `sheet1.xml`: the file numbering
+    // follows creation order, not the tab order the export follows.
+    let path = sheets
+        .iter()
+        .find(|s| !s.hidden)
+        .map(|s| s.path.clone())
+        .unwrap_or_else(|| unpacked.join("xl").join("worksheets").join("sheet1.xml"));
+    let Ok(sheet) = std::fs::read_to_string(path) else {
         return JsonValue::Null;
     };
     let attr = |tag: &str, name: &str| -> Option<String> {
@@ -681,6 +1244,53 @@ fn footer_file_html(path: &std::path::Path) -> Option<String> {
     Some(html)
 }
 
+/// Whether the document's first section shows a distinct first page
+/// (`<w:titlePg/>`, or `<w:titlePg w:val="1|true"/>`).
+fn first_page_distinct(document: &str) -> bool {
+    let Some(section) = split_tags(document, "w:sectPr").into_iter().next() else {
+        return false;
+    };
+    section.contains("<w:titlePg/>")
+        || split_tags(&section, "w:titlePg")
+            .first()
+            .is_some_and(|t| !matches!(attr(t, "w:val").as_deref(), Some("0" | "false" | "off")))
+}
+
+/// File names (in `word/media`) of the pictures in the header page one
+/// shows: the first-page header when the first section turns it on, the
+/// default one otherwise. None when that cannot be worked out, so the caller
+/// keeps every picture rather than guess.
+fn page_one_header_media(unpacked: &std::path::Path) -> Option<Vec<String>> {
+    let word = unpacked.join("word");
+    let document = std::fs::read_to_string(word.join("document.xml")).ok()?;
+    let rels = std::fs::read_to_string(word.join("_rels").join("document.xml.rels")).ok()?;
+    let section = split_tags(&document, "w:sectPr").into_iter().next()?;
+    let wanted = if first_page_distinct(&document) { "first" } else { "default" };
+    let rid = split_tags(&section, "w:headerReference")
+        .into_iter()
+        .find(|h| attr(h, "w:type").as_deref() == Some(wanted))
+        .and_then(|h| attr(&h, "r:id"));
+    let Some(rid) = rid else {
+        return Some(Vec::new()); // page one has no header: no header pictures
+    };
+    let target = split_tags(&rels, "Relationship")
+        .into_iter()
+        .find(|r| attr(r, "Id").as_deref() == Some(rid.as_str()))
+        .and_then(|r| attr(&r, "Target"))?;
+    let header = target.trim_start_matches('/').trim_start_matches("word/");
+    let header_rels = std::fs::read_to_string(
+        word.join("_rels").join(format!("{}.rels", header.rsplit('/').next()?)),
+    )
+    .unwrap_or_default();
+    Some(
+        split_tags(&header_rels, "Relationship")
+            .iter()
+            .filter_map(|r| attr(r, "Target"))
+            .filter_map(|t| t.rsplit('/').next().map(str::to_string))
+            .collect(),
+    )
+}
+
 /// Classify the document's footers as first-page vs default via the section
 /// properties (`<w:footerReference w:type="first|default|even" r:id>`), so the
 /// copyright block that Word shows on page one can go back on page one.
@@ -737,6 +1347,11 @@ fn salvage_footers_classified(unpacked: &std::path::Path) -> JsonValue {
     // Even-page footer only counts when no true default exists.
     if default.is_none() {
         default = even;
+    }
+    // A first-page footer Word never shows: the section does not turn the
+    // distinct first page on.
+    if !first_page_distinct(&refs) {
+        first = None;
     }
 
     // No references found (unusual container): fall back to every distinct
@@ -938,6 +1553,16 @@ async fn salvage_images(
         Err(_) => return Ok(String::new()), // no images in the document
     };
     entries.sort();
+    // Only the pictures of the header page one actually shows. A document
+    // with a first-page header it never switched on (no <w:titlePg/>) carried
+    // that header's big logo into the import.
+    if let Some(shown) = page_one_header_media(unpacked) {
+        entries.retain(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| shown.iter().any(|s| s == n))
+        });
+    }
 
     let mut tags = String::new();
     // A single unreadable/unconvertible media file must not lose the rest —
@@ -1035,3 +1660,68 @@ async fn run(cmd: &mut Command) -> Result<String, AppError> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+
+#[cfg(test)]
+mod sheet_tests {
+    use super::*;
+
+    #[test]
+    fn reads_cell_sizes_wrap_and_per_sheet_print_areas() {
+        let dir = std::env::temp_dir().join(format!("qims-sheet-test-{}", std::process::id()));
+        let xl = dir.join("xl");
+        std::fs::create_dir_all(xl.join("_rels")).unwrap();
+        std::fs::create_dir_all(xl.join("worksheets")).unwrap();
+        std::fs::write(
+            xl.join("workbook.xml"),
+            r#"<workbook><sheets><sheet name="Hidden" sheetId="9" state="hidden" r:id="rId2"/><sheet name="GC &amp; MS" sheetId="1" r:id="rId1"/></sheets><definedNames><definedName name="_xlnm.Print_Area" localSheetId="1">'GC &amp; MS'!$A$1:$M$28</definedName></definedNames></workbook>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            xl.join("_rels").join("workbook.xml.rels"),
+            r#"<Relationships><Relationship Id="rId1" Type="t" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="t" Target="/xl/worksheets/sheet2.xml"/></Relationships>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            xl.join("styles.xml"),
+            r#"<styleSheet><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="10"/></font></fonts><cellStyleXfs><xf fontId="1"/></cellStyleXfs><cellXfs count="2"><xf fontId="0"/><xf fontId="1" applyAlignment="1"><alignment horizontal="center" wrapText="1"/></xf></cellXfs></styleSheet>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            xl.join("worksheets").join("sheet1.xml"),
+            r#"<worksheet><cols><col min="1" max="1" width="10"/></cols><sheetData><row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" s="1" t="s"><v>1</v></c><c r="C1" s="1"/></row></sheetData></worksheet>"#,
+        )
+        .unwrap();
+        std::fs::write(xl.join("worksheets").join("sheet2.xml"), "<worksheet/>").unwrap();
+
+        let sheets = workbook_sheets(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(sheets.len(), 2);
+        assert!(sheets[0].hidden);
+        let gc = &sheets[1].json;
+        assert_eq!(gc["name"], json!("GC & MS"));
+        assert_eq!(gc["print_area"], json!({ "top": 0, "left": 0, "bottom": 27, "right": 12 }));
+        assert_eq!(gc["cells"]["A1"], json!([11.0, false]));
+        assert_eq!(gc["cells"]["B1"], json!([10.0, true]));
+        assert!(gc["cells"].get("C1").is_none(), "empty cells are left out");
+        assert!(too_large(&sheets).is_none());
+        let filled: serde_json::Map<String, JsonValue> =
+            (0..=MAX_SHEET_CELLS).map(|i| (format!("A{i}"), json!([null, false]))).collect();
+        let big = Sheet { hidden: false, path: dir.clone(), json: json!({ "cells": filled }) };
+        let refusal = too_large(std::slice::from_ref(&big)).expect("over the limit");
+        assert!(refusal.contains("20001 filled cells"), "{refusal}");
+        let hidden = Sheet { hidden: true, ..big };
+        assert!(too_large(&[hidden]).is_none(), "hidden sheets do not count");
+
+        let sst = r#"<sst><si><t>plain</t></si><si><r><rPr><b/><sz val="10"/><color rgb="FFFF0000"/></rPr><t>BW =</t></r><r><t xml:space="preserve"> Big well</t></r><r><rPr><vertAlign val="superscript"/><b val="0"/></rPr><t>a</t></r></si></sst>"#;
+        let rich = shared_rich_text(sst);
+        assert!(rich[0].is_none());
+        assert_eq!(
+            rich[1],
+            Some(json!([
+                ["BW =", { "b": true, "sz": 10.0, "color": "#ff0000" }],
+                [" Big well", null],
+                ["a", { "sup": true }]
+            ]))
+        );
+    }
+}
